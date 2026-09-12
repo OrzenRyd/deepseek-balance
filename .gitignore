@@ -1,0 +1,15 @@
+# 编译产物
+.build/
+*.app/
+*.icns
+AppIcon.iconset/
+
+# 发布压缩包
+*.zip
+
+# macOS
+.DS_Store
+
+# Xcode / SwiftPM（本项目未使用，留作万一）
+Package.resolved
+.swiftpm/
