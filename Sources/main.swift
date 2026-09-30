@@ -22,9 +22,81 @@ private let dshCredentialsPath = NSString(string: "~/.dsh/.credentials.yaml").ex
 private let launchAgentPath = NSString(string: "~/Library/LaunchAgents/com.deepseek.balance.plist").expandingTildeInPath
 private let launchAgentLabel = "com.deepseek.balance"
 
-/// 高峰时段（北京时间，周一至周五）：09:00-12:00、14:00-18:00，其余全部为空闲时段。
+/// 高峰时段（北京时间，周一至周五且非法定节假日）：09:00-12:00、14:00-18:00。
+/// 官方规则：其余时段，包括周末及中国法定节假日全天，均为空闲时段。
 /// 空闲时段单价 = 高峰时段单价 × 0.5。
 private let peakWindows: [(start: Int, end: Int)] = [(9 * 60, 12 * 60), (14 * 60, 18 * 60)]
+
+/// 中国法定节假日（含调休拼假的连续放假区间），来源：国务院办公厅
+/// 《关于 2026 年部分节假日安排的通知》（2025-11-04）。
+///
+/// 注意：**调休上班的周末不需要登记在这里**。官方明确「调休上班的周末」也按空闲时段
+/// 计费，而周末在我们的逻辑里本来就判为空闲，所以登记了反而是多余的。
+/// 这里只需要登记落在周一至周五的法定节假日——它们会覆盖掉当天的高峰时段。
+///
+/// 每年 11 月国务院会公布下一年安排，届时在下面追加一行即可。
+private let statutoryHolidayRanges: [(start: String, end: String)] = [
+    ("2026-01-01", "2026-01-03"),  // 元旦（1/1 周四、1/2 周五落在工作日）
+    ("2026-02-15", "2026-02-23"),  // 春节（连休 9 天）
+    ("2026-04-04", "2026-04-06"),  // 清明节（4/6 周一落在工作日）
+    ("2026-05-01", "2026-05-05"),  // 劳动节（5/1 周五、5/4 周一、5/5 周二）
+    ("2026-06-19", "2026-06-21"),  // 端午节（6/19 周五）
+    ("2026-09-25", "2026-09-27"),  // 中秋节（9/25 周五）
+    ("2026-10-01", "2026-10-07"),  // 国庆节（连休 7 天）
+]
+
+/// 把 "yyyy-MM-dd" 转成 yyyyMMdd 整数，方便做集合查找
+private func dayKeyText(_ text: String) -> Int? {
+    let p = text.split(separator: "-")
+    guard p.count == 3, let y = Int(p[0]), let m = Int(p[1]), let d = Int(p[2]) else { return nil }
+    return y * 10000 + m * 100 + d
+}
+
+/// 北京时间下的 yyyyMMdd
+private func dayKey(_ date: Date) -> Int {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = beijingTZ
+    let c = cal.dateComponents([.year, .month, .day], from: date)
+    return (c.year ?? 0) * 10000 + (c.month ?? 0) * 100 + (c.day ?? 0)
+}
+
+/// 北京时间下的年份
+private func beijingYear(_ date: Date) -> Int {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = beijingTZ
+    return cal.component(.year, from: date)
+}
+
+/// 是否为中国法定节假日（全天空闲）
+private func isStatutoryHoliday(_ date: Date) -> Bool {
+    holidayDayKeys.contains(dayKey(date))
+}
+
+/// 展开成具体日期集合
+private let holidayDayKeys: Set<Int> = {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = beijingTZ
+    let fmt = DateFormatter()
+    fmt.timeZone = beijingTZ
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.dateFormat = "yyyy-MM-dd"
+    var set = Set<Int>()
+    for range in statutoryHolidayRanges {
+        guard let start = fmt.date(from: range.start),
+              let end = fmt.date(from: range.end) else { continue }
+        var cursor = start
+        while cursor <= end {
+            set.insert(dayKey(cursor))
+            guard let next = cal.date(byAdding: .day, value: 1, to: cursor) else { break }
+            cursor = next
+        }
+    }
+    return set
+}()
+
+/// 已收录节假日数据的年份；用于在菜单里提示「下一年数据还没公布」
+private let holidayDataYears: Set<Int> = Set(
+    statutoryHolidayRanges.compactMap { Int($0.start.prefix(4)) })
 
 /// 单价（元 / 百万 tokens）——此处为「空闲时段」价格，高峰时段需 ×2。
 private struct ModelPrice {
@@ -46,7 +118,13 @@ private func isPeak(_ date: Date) -> Bool {
     cal.timeZone = beijingTZ
     let c = cal.dateComponents([.weekday, .hour, .minute], from: date)
     guard let wd = c.weekday, let h = c.hour, let m = c.minute else { return false }
+
+    // 官方规则一：中国法定节假日全天按空闲时段计费（哪怕是周一至周五）
+    if holidayDayKeys.contains(dayKey(date)) { return false }
+
+    // 官方规则二：调休上班的周末同样按空闲时段计费，所以周末一律不算高峰
     guard (2...6).contains(wd) else { return false }  // 1 = 周日 ... 7 = 周六
+
     let minutes = h * 60 + m
     return peakWindows.contains { minutes >= $0.start && minutes < $0.end }
 }
@@ -55,7 +133,8 @@ private func isPeak(_ date: Date) -> Bool {
 private func nextTransitionDate(from now: Date) -> Date {
     let current = isPeak(now)
     var probe = Date(timeIntervalSince1970: (now.timeIntervalSince1970 / 60).rounded(.up) * 60)
-    for _ in 0..<(60 * 24 * 10) {
+    // 上限 20 天：足够跨过春节这种 9 天长假再加上前后周末
+    for _ in 0..<(60 * 24 * 20) {
         if isPeak(probe) != current { return probe }
         probe = probe.addingTimeInterval(60)
     }
@@ -358,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.attributedTitle = title
 
         var tip = peak ? "高峰时段（全价）" : "空闲时段（谷值 · 半价）"
+        if isStatutoryHoliday(Date()) { tip += "　法定节假日全天" }
         tip += "\n北京时间 \(clockFormatter.string(from: Date()))"
         if let b = balance {
             tip += "\n总余额 \(symbol(for: balanceCurrency))\(money(b.totalBalance))"
@@ -398,7 +478,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(info(peak ? "距离转入空闲" : "距离转入高峰",
                           "\(humanDuration(next.timeIntervalSince(now)))（\(dateTimeFormatter.string(from: next))）"))
         menu.addItem(info("高峰时段", "周一至周五 09:00–12:00、14:00–18:00"))
-        menu.addItem(info("空闲时段", "其余全部时间（含夜间与周末）"))
+        menu.addItem(info("空闲时段", "其余时间 + 周末 + 法定节假日全天"))
+        if holidayDayKeys.contains(dayKey(now)) {
+            menu.addItem(info("今天", "法定节假日 · 全天空闲", tint: .systemGreen))
+        } else if !holidayDataYears.contains(beijingYear(now)) {
+            menu.addItem(info("⚠️ 提示", "\(beijingYear(now)) 年放假安排尚未收录，节假日可能误判为高峰",
+                              tint: .systemOrange))
+        }
 
         // —— 价格表 ——
         let priceItem = NSMenuItem(title: "当前时段单价（元 / 百万 tokens）", action: nil, keyEquivalent: "")
@@ -620,6 +706,7 @@ private func runSelfTest() {
     fmt.dateFormat = "yyyy-MM-dd HH:mm"
 
     let cases: [(String, Bool)] = [
+        // —— 常规工作日 / 周末 ——
         ("2026-09-12 23:37", false),  // 周六夜间 → 谷
         ("2026-09-13 10:00", false),  // 周日白天 → 谷
         ("2026-09-14 08:59", false),  // 周一 08:59 → 谷
@@ -631,6 +718,33 @@ private func runSelfTest() {
         ("2026-09-18 17:59", true),   // 周五
         ("2026-09-18 18:00", false),
         ("2026-09-19 10:00", false),  // 周六 → 谷
+
+        // —— 法定节假日：工作日时段也必须判为谷 ——
+        ("2026-01-01 10:00", false),  // 元旦 · 周四
+        ("2026-01-02 10:00", false),  // 元旦 · 周五
+        ("2026-02-17 10:00", false),  // 春节 · 周二
+        ("2026-02-23 15:00", false),  // 春节最后一天 · 周一
+        ("2026-04-06 10:00", false),  // 清明 · 周一
+        ("2026-05-01 10:00", false),  // 劳动节 · 周五
+        ("2026-05-04 15:00", false),  // 劳动节 · 周一
+        ("2026-06-19 10:00", false),  // 端午 · 周五
+        ("2026-09-25 10:00", false),  // 中秋 · 周五 ← 最容易踩坑的一天
+        ("2026-10-01 10:00", false),  // 国庆 · 周四
+        ("2026-10-07 15:00", false),  // 国庆最后一天 · 周三
+
+        // —— 假期前后必须恢复为高峰（防止「一刀切放宽」）——
+        ("2026-02-24 10:00", true),   // 春节后第一个工作日 · 周二
+        ("2026-09-28 10:00", true),   // 中秋后 · 周一（工作日，且非节假日）
+        ("2026-09-30 10:00", true),   // 国庆前 · 周三
+        ("2026-10-08 10:00", true),   // 国庆后第一个工作日 · 周四
+        ("2026-04-07 10:00", true),   // 清明后 · 周二
+
+        // —— 调休上班的周末：官方明确仍按空闲计费 ——
+        ("2026-02-14 10:00", false),  // 周六调休上班
+        ("2026-02-28 10:00", false),  // 周六调休上班
+        ("2026-05-09 10:00", false),  // 周六调休上班
+        ("2026-09-20 10:00", false),  // 周日调休上班
+        ("2026-10-10 10:00", false),  // 周六调休上班
     ]
 
     print("=== 峰谷判定自检（北京时间）===")
@@ -646,6 +760,26 @@ private func runSelfTest() {
     let now = Date()
     let peakNow = isPeak(now)
     let next = nextTransitionDate(from: now)
+
+    // 切换点校验：重点验证能否跨越整段长假（倒计时上限 20 天）
+    print("\n=== 峰谷切换点校验 ===")
+    let transitionCases: [(String, String)] = [
+        ("2026-09-14 08:00", "2026-09-14 09:00"),  // 谷 → 峰
+        ("2026-09-14 10:00", "2026-09-14 12:00"),  // 峰 → 谷（午休）
+        ("2026-09-14 12:30", "2026-09-14 14:00"),  // 谷 → 峰
+        ("2026-09-18 17:00", "2026-09-18 18:00"),  // 周五 峰 → 谷
+        ("2026-09-18 20:00", "2026-09-21 09:00"),  // 周五夜 → 下周一（跨周末）
+        ("2026-09-25 08:00", "2026-09-28 09:00"),  // 中秋当天 → 节后周一（跨整段假期）
+        ("2026-09-30 18:30", "2026-10-08 09:00"),  // 国庆前夜 → 节后首个工作日（跨 7 天长假）
+    ]
+    for (from, expected) in transitionCases {
+        guard let d = fmt.date(from: from), let e = fmt.date(from: expected) else { continue }
+        let got = nextTransitionDate(from: d)
+        let ok = abs(got.timeIntervalSince(e)) < 60
+        if !ok { failures += 1 }
+        print("\(ok ? "✅" : "❌") \(from) 起 → \(fmt.string(from: got))  期望 \(expected)")
+    }
+
     print("\n=== 当前状态 ===")
     print("现在：\(fmt.string(from: now)) CST  →  \(peakNow ? "高峰时段（全价）" : "空闲时段（谷值 · 半价）")")
     print("下一次切换：\(fmt.string(from: next)) CST（\(humanDuration(next.timeIntervalSince(now))) 后）→ \(isPeak(next) ? "高峰" : "空闲")")
